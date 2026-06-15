@@ -12,7 +12,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 EXCLUDE_DIR_NAMES = {
     ".git", "node_modules", "vendor", "build", "dist", "target", "out",
@@ -63,8 +63,13 @@ def die(msg: str, code: int = 2) -> None:
 
 
 def run(cmd: list[str], cwd: Path | None = None, check: bool = True) -> str:
-    p = subprocess.run(cmd, cwd=str(cwd) if cwd else None, text=True,
-                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p = subprocess.run(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
     if check and p.returncode != 0:
         die("Command failed:\n" + " ".join(cmd) + "\n" + p.stderr.strip())
     return p.stdout
@@ -89,6 +94,7 @@ def add_fetch_upstream(repo: Path, url: str, branch: str) -> None:
 
 def path_is_binary_name(path: str) -> bool:
     import fnmatch
+
     name = Path(path).name
     return any(fnmatch.fnmatch(name, pat) for pat in BINARY_GLOBS)
 
@@ -407,15 +413,87 @@ def build_messages(chunk: str, idx: int, total: int, args: argparse.Namespace, s
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def load_done(results_path: Path) -> set[int]:
-    done: set[int] = set()
-    if not results_path.exists():
-        return done
-    for line in results_path.read_text(encoding="utf-8", errors="replace").splitlines():
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    if not path.exists():
+        return records
+    for line_no, line in enumerate(path.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
+        if not line.strip():
+            continue
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
+            records.append({
+                "ok": False,
+                "chunk_index": None,
+                "error": f"Invalid JSONL record at line {line_no}",
+                "raw_content": line[:1000],
+            })
             continue
+        if isinstance(rec, dict):
+            records.append(rec)
+    return records
+
+
+def latest_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    latest: dict[int, dict[str, Any]] = {}
+    unchunked: list[dict[str, Any]] = []
+    for rec in records:
+        idx = rec.get("chunk_index")
+        if not isinstance(idx, int):
+            unchunked.append(rec)
+            continue
+        previous = latest.get(idx)
+        if previous is None or float(rec.get("started_at") or 0) >= float(previous.get("started_at") or 0):
+            latest[idx] = rec
+    return unchunked + [latest[idx] for idx in sorted(latest)]
+
+
+def current_llm_records(reports_dir: Path, fallback_records: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+    records = read_jsonl(reports_dir / "llm-results.jsonl")
+    if not records and fallback_records:
+        records = fallback_records
+    return latest_records(records)
+
+
+def extract_findings(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for rec in records:
+        parsed = rec.get("parsed")
+        if not isinstance(parsed, dict):
+            continue
+        for finding in parsed.get("findings", []) or []:
+            if isinstance(finding, dict):
+                item = dict(finding)
+                item.setdefault("chunk_index", rec.get("chunk_index"))
+                findings.append(item)
+    return findings
+
+
+def write_latest_outputs(reports_dir: Path, records: list[dict[str, Any]], static_findings: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+    latest = latest_records(records)
+    findings = extract_findings(latest)
+    risk, _ = risk_summary(latest)
+
+    (reports_dir / "llm-results-latest.json").write_text(
+        json.dumps(latest, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    (reports_dir / "findings-latest.json").write_text(
+        json.dumps({
+            "highest_llm_risk": risk,
+            "static_findings_count": len(static_findings),
+            "llm_findings_count": len(findings),
+            "findings": findings,
+        }, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8",
+    )
+    return risk, findings
+
+
+def load_done(results_path: Path) -> set[int]:
+    done: set[int] = set()
+    for rec in latest_records(read_jsonl(results_path)):
         if rec.get("ok") and isinstance(rec.get("chunk_index"), int):
             done.add(rec["chunk_index"])
     return done
@@ -504,9 +582,16 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
     reports.mkdir(parents=True, exist_ok=True)
     (reports / "static-findings.json").write_text(json.dumps(static_findings, indent=2) + "\n", encoding="utf-8")
 
-    ok = sum(1 for r in llm_records if r.get("ok"))
-    bad = len(llm_records) - ok
-    risk, llm_findings = risk_summary(llm_records)
+    if args.no_llm:
+        ok = 0
+        bad = 0
+        risk = "none"
+        llm_findings: list[dict[str, Any]] = []
+    else:
+        current_records = current_llm_records(reports, llm_records)
+        ok = sum(1 for r in current_records if r.get("ok"))
+        bad = len(current_records) - ok
+        risk, llm_findings = write_latest_outputs(reports, current_records, static_findings)
 
     md: list[str] = []
     md.append("# Fork Audit Report\n\n")
@@ -527,6 +612,8 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
         md.append(f"- LLM chunks OK: **{ok}**\n")
         md.append(f"- LLM chunks failed/invalid: **{bad}**\n")
         md.append(f"- Highest LLM risk: **{risk}**\n")
+        md.append("- Latest LLM records: `reports/llm-results-latest.json`\n")
+        md.append("- Latest findings summary: `reports/findings-latest.json`\n")
     md.append("\n> This is triage, not proof of safety. Manually review scripts, workflows, build files, and any high-risk findings.\n\n")
 
     md.append("## Static findings sample\n")
@@ -544,7 +631,8 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
         md.append("LLM review disabled.\n")
     elif llm_findings:
         for item in llm_findings:
-            md.append(f"- **{item.get('risk', 'unknown')}** `{item.get('file', '?')}` — {item.get('title', '')}\n")
+            chunk_info = f" chunk {item.get('chunk_index')}" if item.get("chunk_index") is not None else ""
+            md.append(f"- **{item.get('risk', 'unknown')}** `{item.get('file', '?')}`{chunk_info} — {item.get('title', '')}\n")
             if item.get("evidence"):
                 md.append(f"  - Evidence: {item.get('evidence')}\n")
             if item.get("recommended_review"):
@@ -558,7 +646,10 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
     md.append("- `meta/name-status.filtered.txt`\n")
     md.append("- `files/`\n")
     md.append("- `reports/static-findings.json`\n")
-    md.append("- `reports/llm-results.jsonl`\n")
+    if not args.no_llm:
+        md.append("- `reports/llm-results.jsonl` — append-only raw LLM chunk history\n")
+        md.append("- `reports/llm-results-latest.json` — latest record per chunk\n")
+        md.append("- `reports/findings-latest.json` — latest finding summary\n")
     (reports / "report.md").write_text("".join(md), encoding="utf-8")
 
 
@@ -629,8 +720,11 @@ def main() -> int:
     print(f"Files copied: {len(files)}")
     print(f"Static findings: {len(static_findings)}")
     if not args.no_llm:
-        ok = sum(1 for r in llm_records if r.get("ok"))
-        print(f"LLM chunks valid: {ok}/{len(llm_records)}")
+        latest = current_llm_records(args.out / "reports", llm_records)
+        ok = sum(1 for r in latest if r.get("ok"))
+        print(f"LLM chunks valid: {ok}/{len(latest)}")
+        print(f"Latest LLM records: {args.out / 'reports' / 'llm-results-latest.json'}")
+        print(f"Latest findings: {args.out / 'reports' / 'findings-latest.json'}")
     return 0
 
 
