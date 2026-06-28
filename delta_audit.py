@@ -56,6 +56,19 @@ SUSPICIOUS = [
     ("js_http", r"\b(fetch|axios\.get|request\s*\()\s*\(", "JavaScript HTTP request"),
 ]
 
+INTENT_CANDIDATE_PATHS = [
+    "README.md",
+    "readme.md",
+    "README.rst",
+    "README.txt",
+    "docs/README.md",
+    "docs/readme.md",
+    "docs/usage.md",
+    "docs/USAGE.md",
+    "pyproject.toml",
+    "package.json",
+]
+
 
 def die(msg: str, code: int = 2) -> None:
     print(f"ERROR: {msg}", file=sys.stderr)
@@ -324,6 +337,49 @@ def review_text(out: Path, mode: str) -> str:
     return patch + "\n\n" + files
 
 
+def read_project_intent_context(repo: Path, max_chars: int) -> str:
+    parts: list[str] = []
+    remaining = max_chars
+    for rel in INTENT_CANDIDATE_PATHS:
+        if remaining <= 0:
+            break
+        path = repo / rel
+        if not path.is_file() or looks_binary(path):
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if not text.strip():
+            continue
+        piece = f"\n--- PROJECT INTENT FILE: {rel} ---\n{text}\n"
+        if len(piece) > remaining:
+            piece = piece[:remaining] + "\n[truncated]\n"
+        parts.append(piece)
+        remaining -= len(piece)
+    return "".join(parts).strip()
+
+
+def risk_mode_instructions(args: argparse.Namespace) -> str:
+    if args.risk_mode == "hard":
+        return (
+            "Risk mode: HARD fork-trust triage. Report only behavior that is likely malicious, hidden, "
+            "unrelated to the declared or plainly evidenced project purpose, contradictory to the provided "
+            "documentation/metadata, or severe negligence. Prioritize credential or secret access, persistence, "
+            "obfuscation, covert or unrelated network behavior, unexpected process execution, unauthorized "
+            "filesystem access, install/build abuse, severe security boundary bypass, and dangerous behavior that "
+            "is not justified by the project context. Do not report generic attack surface, routine hardening "
+            "advice, or ordinary implementation of documented features as findings. If behavior is sensitive but "
+            "appears to be an expected part of the documented project, put it in expected_sensitive_behavior, not "
+            "findings. If no intent context is provided or the intent is inconclusive, only report clear hard-risk "
+            "signals rather than generic surface area."
+        )
+    return (
+        "Risk mode: BROAD security review. Report conventional security issues, hardening concerns, and "
+        "security-sensitive surfaces, but still avoid noise and ordinary implementation complexity."
+    )
+
+
 def model_name_for_api(model: str) -> str:
     return model.removeprefix("openai/")
 
@@ -378,13 +434,17 @@ def json_from_text(text: str) -> Any | None:
     return None
 
 
-def build_messages(chunk: str, idx: int, total: int, args: argparse.Namespace, static_sample: list[dict[str, Any]]) -> list[dict[str, str]]:
+def build_messages(
+    chunk: str,
+    idx: int,
+    total: int,
+    args: argparse.Namespace,
+    static_sample: list[dict[str, Any]],
+    intent_context: str,
+) -> list[dict[str, str]]:
     system = (
-        "You are a cautious supply-chain security reviewer. Audit repository code or git diff chunks. "
-        "Focus only on security-relevant behavior: hidden network calls, credential access, shell/process execution, "
-        "persistence, build/install script abuse, unexpected downloads, exfiltration, backdoors, dependency confusion, "
-        "and code that weakens authentication or safety boundaries. Do not flag ordinary implementation complexity. "
-        "Return JSON only."
+        "You are a cautious supply-chain and fork-trust security reviewer. Audit repository code or git diff chunks. "
+        "Return JSON only. Be precise and avoid generic warnings."
     )
     schema = {
         "chunk_index": idx,
@@ -402,10 +462,42 @@ def build_messages(chunk: str, idx: int, total: int, args: argparse.Namespace, s
                 "recommended_review": "next manual check",
             }
         ],
+        "expected_sensitive_behavior": [
+            {
+                "file": "path if known",
+                "line_or_hunk": "line/hunk if known",
+                "behavior": "sensitive behavior that appears expected",
+                "why_expected": "why project intent or code context suggests it is expected",
+                "residual_caution": "short caution, optional",
+            }
+        ],
         "benign_notes": ["short notes"],
     }
+
+    if args.intent_from_readme:
+        if intent_context:
+            intent_section = (
+                "Declared project intent context from repository docs/metadata:\n"
+                f"{intent_context}\n\n"
+                "Use this only to decide whether behavior is supported by the project's own stated purpose. "
+                "Do not create broad exemptions from generic feature categories; only treat behavior as expected "
+                "when this context or the code evidence supports that conclusion."
+            )
+        else:
+            intent_section = (
+                "Declared project intent context was requested, but no README/project metadata was found. "
+                "Do not infer broad exemptions from generic project categories."
+            )
+    else:
+        intent_section = (
+            "No declared project intent context was provided. Evaluate only from code/diff evidence and avoid "
+            "generic assumptions about what the project should or should not do."
+        )
+
     user = (
-        f"Audit context: mode={args.mode}, focus={args.focus}, repo={args.repo}\n"
+        f"Audit context: mode={args.mode}, focus={args.focus}, risk_mode={args.risk_mode}, repo={args.repo}\n\n"
+        f"{risk_mode_instructions(args)}\n\n"
+        f"{intent_section}\n\n"
         f"Static pattern sample:\n{json.dumps(static_sample[:40], indent=2)}\n\n"
         f"Return JSON matching this schema:\n{json.dumps(schema, indent=2)}\n\n"
         f"Audit chunk {idx}/{total}:\n\n{chunk}"
@@ -466,13 +558,34 @@ def extract_findings(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if isinstance(finding, dict):
                 item = dict(finding)
                 item.setdefault("chunk_index", rec.get("chunk_index"))
+                item.setdefault("risk_mode", rec.get("risk_mode"))
                 findings.append(item)
     return findings
 
 
-def write_latest_outputs(reports_dir: Path, records: list[dict[str, Any]], static_findings: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
+def extract_expected_sensitive_behavior(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    expected: list[dict[str, Any]] = []
+    for rec in records:
+        parsed = rec.get("parsed")
+        if not isinstance(parsed, dict):
+            continue
+        for item in parsed.get("expected_sensitive_behavior", []) or []:
+            if isinstance(item, dict):
+                out = dict(item)
+                out.setdefault("chunk_index", rec.get("chunk_index"))
+                out.setdefault("risk_mode", rec.get("risk_mode"))
+                expected.append(out)
+    return expected
+
+
+def write_latest_outputs(
+    reports_dir: Path,
+    records: list[dict[str, Any]],
+    static_findings: list[dict[str, Any]],
+) -> tuple[str, list[dict[str, Any]], list[dict[str, Any]]]:
     latest = latest_records(records)
     findings = extract_findings(latest)
+    expected = extract_expected_sensitive_behavior(latest)
     risk, _ = risk_summary(latest)
 
     (reports_dir / "llm-results-latest.json").write_text(
@@ -482,13 +595,17 @@ def write_latest_outputs(reports_dir: Path, records: list[dict[str, Any]], stati
     (reports_dir / "findings-latest.json").write_text(
         json.dumps({
             "highest_llm_risk": risk,
+            "risk_modes": sorted({str(r.get("risk_mode", "unknown")) for r in latest}),
+            "intent_from_readme_used": any(bool(r.get("intent_from_readme")) for r in latest),
             "static_findings_count": len(static_findings),
             "llm_findings_count": len(findings),
+            "expected_sensitive_behavior_count": len(expected),
             "findings": findings,
+            "expected_sensitive_behavior": expected,
         }, indent=2, ensure_ascii=False) + "\n",
         encoding="utf-8",
     )
-    return risk, findings
+    return risk, findings, expected
 
 
 def load_done(results_path: Path) -> set[int]:
@@ -505,13 +622,20 @@ def llm_review(args: argparse.Namespace, out: Path, static_findings: list[dict[s
     chunks_dir = out / "llm_chunks"
     chunks_dir.mkdir(parents=True, exist_ok=True)
     reports = out / "reports"
+    meta = out / "meta"
     results_path = reports / "llm-results.jsonl"
     raw_dir = reports / "llm-raw"
     raw_dir.mkdir(parents=True, exist_ok=True)
 
+    intent_context = ""
+    if args.intent_from_readme:
+        intent_context = read_project_intent_context(args.repo, args.intent_max_chars)
+        (meta / "intent-context.txt").write_text(intent_context + "\n", encoding="utf-8")
+
     done = load_done(results_path) if args.resume else set()
     mode = "a" if args.resume else "w"
     records: list[dict[str, Any]] = []
+    skip_label = "--retry-failed" if args.retry_failed else "--resume"
 
     with results_path.open(mode, encoding="utf-8") as f:
         for idx, chunk in enumerate(chunks, 1):
@@ -522,7 +646,7 @@ def llm_review(args: argparse.Namespace, out: Path, static_findings: list[dict[s
             chunk_path = chunks_dir / f"chunk-{idx:04d}.txt"
             chunk_path.write_text(chunk, encoding="utf-8")
             if idx in done:
-                print(f"LLM chunk {idx}/{len(chunks)}: skipped by --resume", file=sys.stderr)
+                print(f"LLM chunk {idx}/{len(chunks)}: skipped by {skip_label}", file=sys.stderr)
                 continue
 
             started = time.time()
@@ -531,9 +655,11 @@ def llm_review(args: argparse.Namespace, out: Path, static_findings: list[dict[s
                 "chunk_total": len(chunks),
                 "chunk_file": str(chunk_path),
                 "started_at": started,
+                "risk_mode": args.risk_mode,
+                "intent_from_readme": bool(args.intent_from_readme),
             }
             try:
-                content, raw = chat(args, build_messages(chunk, idx, len(chunks), args, static_findings))
+                content, raw = chat(args, build_messages(chunk, idx, len(chunks), args, static_findings, intent_context))
                 parsed = json_from_text(content)
                 raw_path = raw_dir / f"chunk-{idx:04d}.response.json"
                 raw_path.write_text(json.dumps(raw, indent=2) + "\n", encoding="utf-8")
@@ -582,6 +708,7 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
     reports.mkdir(parents=True, exist_ok=True)
     (reports / "static-findings.json").write_text(json.dumps(static_findings, indent=2) + "\n", encoding="utf-8")
 
+    expected_behavior: list[dict[str, Any]] = []
     if args.no_llm:
         ok = 0
         bad = 0
@@ -591,7 +718,7 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
         current_records = current_llm_records(reports, llm_records)
         ok = sum(1 for r in current_records if r.get("ok"))
         bad = len(current_records) - ok
-        risk, llm_findings = write_latest_outputs(reports, current_records, static_findings)
+        risk, llm_findings, expected_behavior = write_latest_outputs(reports, current_records, static_findings)
 
     md: list[str] = []
     md.append("# Fork Audit Report\n\n")
@@ -599,6 +726,8 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
     md.append(f"- Repository: `{args.repo}`\n")
     md.append(f"- Mode: `{args.mode}`\n")
     md.append(f"- Focus: `{args.focus}`\n")
+    md.append(f"- Risk mode: `{args.risk_mode}`\n")
+    md.append(f"- Intent from README/docs: **{bool(args.intent_from_readme)}**\n")
     md.append(f"- Base: `{base or 'N/A'}`\n")
     md.append(f"- Range: `{range_expr}`\n")
     md.append(f"- Filtered files copied: **{len(files)}**\n")
@@ -612,6 +741,7 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
         md.append(f"- LLM chunks OK: **{ok}**\n")
         md.append(f"- LLM chunks failed/invalid: **{bad}**\n")
         md.append(f"- Highest LLM risk: **{risk}**\n")
+        md.append(f"- Expected sensitive behavior notes: **{len(expected_behavior)}**\n")
         md.append("- Latest LLM records: `reports/llm-results-latest.json`\n")
         md.append("- Latest findings summary: `reports/findings-latest.json`\n")
     md.append("\n> This is triage, not proof of safety. Manually review scripts, workflows, build files, and any high-risk findings.\n\n")
@@ -640,10 +770,27 @@ def write_report(args: argparse.Namespace, out: Path, base: str, range_expr: str
     else:
         md.append("No meaningful LLM findings were parsed. Check `reports/llm-results.jsonl` for failures.\n")
 
+    if not args.no_llm:
+        md.append("\n## Expected sensitive behavior\n")
+        if expected_behavior:
+            for item in expected_behavior[:100]:
+                chunk_info = f" chunk {item.get('chunk_index')}" if item.get("chunk_index") is not None else ""
+                md.append(f"- `{item.get('file', '?')}`{chunk_info} — {item.get('behavior', '')}\n")
+                if item.get("why_expected"):
+                    md.append(f"  - Why expected: {item.get('why_expected')}\n")
+                if item.get("residual_caution"):
+                    md.append(f"  - Caution: {item.get('residual_caution')}\n")
+            if len(expected_behavior) > 100:
+                md.append(f"- ... {len(expected_behavior) - 100} more in `reports/findings-latest.json`\n")
+        else:
+            md.append("No expected sensitive behavior notes were parsed.\n")
+
     md.append("\n## Useful files\n")
     md.append("- `meta/changes.patch`\n")
     md.append("- `meta/name-status.raw.txt`\n")
     md.append("- `meta/name-status.filtered.txt`\n")
+    if args.intent_from_readme:
+        md.append("- `meta/intent-context.txt`\n")
     md.append("- `files/`\n")
     md.append("- `reports/static-findings.json`\n")
     if not args.no_llm:
@@ -665,6 +812,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--three-dot", action="store_true", help="Use A...HEAD for --mode since instead of A..HEAD")
 
     p.add_argument("--focus", choices=["all", "control", "runtime"], default="all")
+    p.add_argument("--risk-mode", choices=["broad", "hard"], default=os.environ.get("AUDIT_RISK_MODE", "broad"),
+                   help="broad reports normal AppSec/hardening issues; hard reports only obvious hard-risk, malicious, hidden, or severe-negligence signals.")
+    p.add_argument("--intent-from-readme", action="store_true",
+                   help="Include README/docs/project metadata as declared-intent context for the LLM review.")
+    p.add_argument("--intent-max-chars", type=int, default=16_000,
+                   help="Maximum characters of README/docs/project metadata to include as intent context.")
     p.add_argument("--review", choices=["patch", "files", "both"], default="patch")
     p.add_argument("--include-tests", action="store_true")
     p.add_argument("--max-file-bytes", type=int, default=2_000_000)
@@ -674,6 +827,8 @@ def parse_args() -> argparse.Namespace:
 
     p.add_argument("--no-llm", action="store_true")
     p.add_argument("--resume", action="store_true")
+    p.add_argument("--retry-failed", action="store_true",
+                   help="Alias for --resume that makes the intent explicit: skip latest ok chunks and rerun failed/invalid chunks with the current settings.")
     p.add_argument("--force", action="store_true")
 
     p.add_argument("--api-key", default=os.environ.get("AUDIT_LLM_API_KEY", "local"))
@@ -688,6 +843,10 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.retry_failed:
+        args.resume = True
+    if args.retry_failed and args.force:
+        die("--retry-failed cannot be combined with --force")
     args.repo = args.repo.expanduser().resolve()
     args.out = args.out.expanduser().resolve()
 
@@ -698,7 +857,7 @@ def main() -> int:
         if args.force:
             shutil.rmtree(args.out)
         elif not args.resume:
-            die(f"Output directory exists: {args.out}\nUse --resume or --force.")
+            die(f"Output directory exists: {args.out}\nUse --resume, --retry-failed, or --force.")
     args.out.mkdir(parents=True, exist_ok=True)
     (args.out / "reports").mkdir(parents=True, exist_ok=True)
 
@@ -719,6 +878,8 @@ def main() -> int:
     print(f"Report: {args.out / 'reports' / 'report.md'}")
     print(f"Files copied: {len(files)}")
     print(f"Static findings: {len(static_findings)}")
+    print(f"Risk mode: {args.risk_mode}")
+    print(f"Intent from README/docs: {bool(args.intent_from_readme)}")
     if not args.no_llm:
         latest = current_llm_records(args.out / "reports", llm_records)
         ok = sum(1 for r in latest if r.get("ok"))
